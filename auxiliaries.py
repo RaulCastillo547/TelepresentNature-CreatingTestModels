@@ -638,6 +638,108 @@ class ClassificationWindow():
 
         combined_df.to_csv(f'CSVFiles/ExtendedCSV/{url_dest}_extended.csv', index=False)
 
+class RNNWindow():
+    def __init__(self, csv_name):
+        # Load and Edit Pandas DF
+        self.orig_df = pd.read_csv(f'CSVFiles/CleanCSV/{csv_name}.csv')
+        self.orig_df['timestamp'] = pd.DatetimeIndex(self.orig_df['timestamp'])
+        self.orig_df['month'] = self.orig_df['timestamp'].map(lambda x: x.month)
+        self.orig_df['day'] = self.orig_df['timestamp'].map(lambda x: x.day)
+        self.timeline = self.orig_df.pop('timestamp')
+
+        # Split Data Up
+        n = len(self.orig_df)
+        self.train_df = self.orig_df[0:int(n*0.7)]
+        self.test_df = self.orig_df[int(n*0.7):]
+
+        # Normalize Data
+        self.norm_train_df = (self.train_df - self.train_df.mean())/self.train_df.std()
+        self.norm_test_df = (self.test_df - self.train_df.mean())/self.train_df.std()
+
+        # Split Input and Labels
+        self.train_input, self.train_label = self.split_data(self.norm_train_df, OUT_STEPS)
+        self.test_input, self.test_label = self.split_data(self.norm_test_df, OUT_STEPS)
+
+    def split_data(self, df, time_steps):
+        assert len(df) >= time_steps
+        input_sample = []
+        output_sample = []
+
+        for index in range(0, len(df) - time_steps, time_steps):
+            section = df[index:index+time_steps]
+            input_sample.append(section[['external-temperature', 'month', 'day']].values)
+            output_sample.append(section[['longitude', 'latitude', 'altitude']].values)
+
+        input_sample = np.array(input_sample)
+        output_sample = np.array(output_sample)
+
+        return input_sample, output_sample
+
+    def model_compilation_and_fitting(self, model, patience=2):
+        model.compile(loss=tf.keras.losses.MeanSquaredError(),
+                      optimizer=tf.keras.optimizers.Adam(),
+                      metrics=[tf.keras.metrics.MeanAbsoluteError(), tf.keras.metrics.MeanSquaredError()])
+        
+        history = model.fit(self.train_input, self.train_label, epochs=MAX_EPOCS,
+                            callbacks=[tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=patience, mode='min')])
+        
+        return history
+
+    def csv_extension(self, url_dest, species, model = None, out_steps = OUT_STEPS):
+        data = {
+            'timestamp': [],
+            'longitude': [],
+            'latitude': [],
+            'altitude': [],
+            'external-temperature': [],
+            'month': [],
+            'day': []
+        }
+        
+        avg_temp = self.orig_df.groupby(['month', 'day']).mean()['external-temperature']
+
+        for i in range(out_steps):
+            assert species == 'Moose' or species == 'Deer'
+            if (species == 'Moose'):
+                curr_date = max(self.timeline) + datetime.timedelta(hours=3*(i+1))
+            elif (species == 'Deer'):
+                curr_date = max(self.timeline) + datetime.timedelta(hours=4*(i+1))
+
+            external_temp = avg_temp[curr_date.month][curr_date.day]
+            month = curr_date.month
+            day = curr_date.day
+
+            output_fields = model(np.array([(external_temp - self.train_df.mean()['external-temperature'])/self.train_df.std()['external-temperature'], 
+                                            (month - self.train_df.mean()['month'])/self.train_df.std()['month'], 
+                                            (day - self.train_df.mean()['day'])/self.train_df.std()['day']]).reshape([1, 1, 3]))*self.train_df[['longitude', 'latitude', 'altitude']].std() + self.train_df[['longitude', 'latitude', 'altitude']].mean()
+
+            output_fields = output_fields.numpy()[0][0]
+
+            longitude = output_fields[0]
+            latitude = output_fields[1] 
+            altitude = output_fields[2]
+
+            data['longitude'].append(longitude)
+            data['latitude'].append(latitude)
+            data['altitude'].append(altitude)
+            data['external-temperature'].append(external_temp)
+            data['month'].append(curr_date.month)
+            data['day'].append(curr_date.day)
+            data['timestamp'].append(curr_date)
+        
+        add_on_df = pd.DataFrame(data)
+        add_on_df['modeled'] = True
+
+        base_df = self.orig_df.copy(deep=True)
+        base_df['timestamp'] = self.timeline
+        base_df['modeled'] = False
+        
+        combined_df = pd.concat([base_df, add_on_df], ignore_index=True)
+
+        combined_df = combined_df[['timestamp', 'month', 'day', 'external-temperature', 'longitude', 'latitude', 'altitude', 'modeled']]
+
+        combined_df.to_csv(f'CSVFiles/ExtendedCSV/{url_dest}_extended.csv', index=False)
+
 @tf.keras.utils.register_keras_serializable()
 class FeedBack(tf.keras.Model):
     def __init__(self, units, out_steps, num_vars):
